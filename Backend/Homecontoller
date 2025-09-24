@@ -1,1 +1,549 @@
+using Microsoft.AspNetCore.Identity.Data;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using project2.Models;
+using System.ComponentModel.DataAnnotations;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+
+namespace project2.Controllers
+{
+
+    [Route("api/[controller]")]
+    [ApiController]
+    public class HomeController : ControllerBase
+
+    {
+        private readonly SafetyDbContext _context;//ILogger<HomeController> _logger;
+        private readonly ComplainDAL dal;
+
+        public HomeController(SafetyDbContext context)
+        {
+            _context = context;
+            dal = new ComplainDAL();
+        }
+
+
+        [HttpPost("login")]
+        public IActionResult SimpleLogin([FromBody] Models.LoginRequest request)
+
+        {
+            if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
+                return BadRequest("Email and password are required.");
+
+            var user = _context.Users.FirstOrDefault(u => u.Email == request.Email && u.PasswordHash == request.Password);
+
+            if (user == null)
+                return Unauthorized("Invalid email or password.");
+
+            return Ok(new
+            {
+                Message = "Login successful.",
+                UserId = user.UserId,
+                Role = user.Role
+            });
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] UserRegistrationRequest request)
+        {
+            // 1a. Email format and uniqueness
+            if (!new EmailAddressAttribute().IsValid(request.Email))
+                return BadRequest("Invalid email format.");
+
+            if (_context.Users.Any(u => u.Email == request.Email))
+                return BadRequest("Email is already registered.");
+
+            // 1b. Password strength
+            if (!Regex.IsMatch(request.Password, @"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,16}$"))
+                return BadRequest("Password must be 8–16 characters and include uppercase, lowercase, number, and special character.");
+
+            // 1c. Username format and uniqueness
+            if (!Regex.IsMatch(request.Username, @"^[a-zA-Z0-9_]+$"))
+                return BadRequest("Username can only contain letters, numbers, and underscores.");
+
+            if (_context.Users.Any(u => u.FirstName == request.Username)) // Adjust if you store username separately
+                return BadRequest("Username is already taken.");
+
+            // 1d. Phone number format and uniqueness
+            if (!Regex.IsMatch(request.PhoneNumber, @"^[6-9]\d{9}$"))
+                return BadRequest("Invalid phone number format.");
+
+            if (_context.Users.Any(u => u.LastName == request.PhoneNumber)) // Adjust if phone is stored separately
+                return BadRequest("Phone number is already registered.");
+
+            // 1e. Age check
+            var age = DateTime.Today.Year - request.DateOfBirth.Year;
+            if (request.DateOfBirth > DateTime.Today.AddYears(-age)) age--;
+            if (age < 18)
+                return BadRequest("User must be at least 18 years old.");
+
+            // Create user
+            var newUser = new User
+            {
+                FirstName = request.FirstName,
+                LastName = request.LastName,
+                Email = request.Email,
+                PasswordHash = request.Password, // In production, hash this!
+                Role = "Worker",
+                CreatedAt = DateTime.Now,
+                UpdatedAt = DateTime.Now
+            };
+
+            _context.Users.Add(newUser);
+            await _context.SaveChangesAsync();
+
+            // 2. Send confirmation (mocked here)
+            Debug.WriteLine($"Confirmation sent to {newUser.Email}");
+
+            // 5. Redirect to login (frontend handles this)
+            return Ok(new
+            {
+                Message = "Registration successful. Please log in.",
+                RedirectUrl = "/login"
+            });
+        }
+
+        [HttpGet("user/{id}")]
+
+        public ActionResult<IEnumerable<User>> GetUser(int id)
+        {
+            var user = _context.Users.FirstOrDefault(x => x.UserId == id);
+
+            if (user == null)
+            {
+                return NotFound($"User with ID {id} not found.");
+            }
+            return Ok(user);
+        }
+
+        [HttpGet("users")]
+        public ActionResult<IEnumerable<User>> GetAllUsers()
+        {
+            var users = _context.Users.ToList();
+
+            if (!users.Any())
+            {
+                return NotFound("No users found.");
+            }
+
+            return Ok(users);
+        }
+
+        [HttpPost("postfeedback")]
+        public async Task<IActionResult> SubmitFeedback([FromBody] FeedbackDTO request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest("Comment is required.");
+
+            var user = await _context.Users.FindAsync(request.UserId);
+            if (user == null)
+                return NotFound($"User with ID {request.UserId} not found.");
+
+            var feedback = new Feedback
+            {
+                UserId = request.UserId,
+                Comment = request.Comment,
+                Rating = request.Rating,
+                CreatedAt = DateTime.UtcNow
+            };
+
+            _context.Feedbacks.Add(feedback);
+            await _context.SaveChangesAsync();
+
+            return Ok(new
+            {
+                Message = "Feedback submitted successfully.",
+                FeedbackId = feedback.FeedbackId,
+                CreatedAt = feedback.CreatedAt
+            });
+        }
+
+        //raise a complaint by user 
+
+        [HttpPost("raisecomplain")]
+        public IActionResult PostComplaint([FromBody] TitleDesc td)
+        {
+            try
+            {
+                dal.RaiseAComplain(td);
+                return Ok();
+
+            }
+            catch (Exception ex)
+            {
+                return Problem(detail: ex.Message, statusCode: 500);
+            }
+        }
+
+
+        [HttpGet("TrackStatus/{userId}")]
+        public IActionResult TrackStatus(int userId)
+        {
+            var status = _context.Complaints
+                .Where(c => c.UserId == userId)
+                .Select(c => c.Status)
+                .FirstOrDefault();
+
+            if (status == null)
+            {
+                return NotFound(new { Message = "No complaint status found for this user." });
+            }
+
+            return Ok(new { Status = status });
+        }
+        
+
+        [HttpGet("complaints/inprogress")]
+        public ActionResult<IEnumerable<Complaint>> GetInProgressComplaints()
+        {
+            // Retrieves all complaints where the status is 'In Progress'.
+            var inProgressComplaints = _context.Complaints
+                .Where(c => c.Status == "In Progress")
+                .ToList();
+
+            return Ok(inProgressComplaints);
+        }
+
+        [HttpGet("complaints/resolved/{userId}")]
+        public ActionResult<IEnumerable<Complaint>> GetResolvedComplaintsByUser(int userId)
+        {
+            // Retrieves all complaints from a specific user that have been resolved,
+            // and orders them by the resolution date.
+            var resolvedComplaints = _context.Complaints
+                .Where(c => c.UserId == userId && c.Status == "Resolved")
+                .OrderByDescending(c => c.ResolvedAt)
+                .ToList();
+
+            if (!resolvedComplaints.Any())
+            {
+                return NotFound($"No resolved complaints found for user ID {userId}.");
+            }
+
+            return Ok(resolvedComplaints);
+        }
+        //user can see the faqs which has been posted by admin.
+        [HttpGet("faqs")]
+        public IActionResult GetFAQs()
+        {
+            var faqs = _context.FAQs.OrderByDescending(f => f.CreatedAt).ToList();
+            return Ok(faqs);
+        }
+
+
+
+
+
+
+        //Admin Functionalities
+
+        //View all Complaines
+        [HttpGet("complaintall")]
+        public ActionResult<Complaint> getallComp()
+        {
+            try
+            {
+                List<Complaint> listt = dal.allComplaint();
+                return Ok(listt);
+            }
+            catch (Exception ex)
+            {
+                return Problem(detail: ex.Message, statusCode: 500);
+            }
+        }
+
+
+        // View Stock Management
+        [HttpGet("stock")]
+        public ActionResult<IEnumerable<Stock>> GetStocks()
+        {
+            var stocks = _context.Stocks.ToList();
+            return Ok(stocks);
+        }
+
+        //Admin will Add the frequently asked quetions
+        [HttpPost("add-faq")]
+        public async Task<IActionResult> AddFAQ([FromBody] FAQ faq)
+        {
+            if (!ModelState.IsValid)
+            {
+                var errors = ModelState.Values.SelectMany(v => v.Errors)
+                                              .Select(e => e.ErrorMessage)
+                                              .ToList();
+                return BadRequest(new { Message = "Validation failed.", Errors = errors });
+            }
+
+            try
+            {
+                _context.FAQs.Add(faq);
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    Message = "FAQ added successfully.",
+                    FAQId = faq.FAQId,
+                    CreatedAt = faq.CreatedAt
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Message = "An error occurred while saving the FAQ.", Error = ex.Message });
+            }
+        }
+
+       //Admin can also edit the faq with help of faqid
+        [HttpPut("update-faq/{id}")]
+        public async Task<IActionResult> UpdateFAQ(int id, [FromBody] FAQ updatedFaq)
+        {
+            if (!ModelState.IsValid)
+            {
+                var errors = ModelState.Values
+                    .SelectMany(v => v.Errors)
+                    .Select(e => e.ErrorMessage)
+                    .ToList();
+
+                return BadRequest(new { Message = "Validation failed.", Errors = errors });
+            }
+
+            var existingFaq = await _context.FAQs.FindAsync(id);
+            if (existingFaq == null)
+            {
+                return NotFound(new { Message = $"FAQ with ID {id} not found." });
+            }
+
+            try
+            {
+                existingFaq.Question = updatedFaq.Question;
+                existingFaq.Answer = updatedFaq.Answer;
+                existingFaq.CreatedAt = DateTime.Now; // Optional: update timestamp
+
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    Message = "FAQ updated successfully.",
+                    FAQId = existingFaq.FAQId,
+                    UpdatedAt = existingFaq.CreatedAt
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Message = "An error occurred while updating the FAQ.", Error = ex.Message });
+            }
+        }
+        //Admin can also delete the faq with the help of faqid
+        [HttpDelete("delete-faq/{id}")]
+        public async Task<IActionResult> DeleteFAQ(int id)
+        {
+            var faq = await _context.FAQs.FindAsync(id);
+            if (faq == null)
+            {
+                return NotFound(new { Message = $"FAQ with ID {id} not found." });
+            }
+
+            try
+            {
+                _context.FAQs.Remove(faq);
+                await _context.SaveChangesAsync();
+
+                return Ok(new
+                {
+                    Message = "FAQ deleted successfully.",
+                    FAQId = id
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    Message = "An error occurred while deleting the FAQ.",
+                    Error = ex.Message
+                });
+            }
+        }
+        //Admin can View feedback's that posted by worker's 
+        [HttpGet("getfeedback")]
+        public IActionResult GetAllFeedback()
+        {
+            var feedbackList = _context.Feedbacks
+                .OrderByDescending(f => f.CreatedAt)
+                .ToList();
+
+            if (!feedbackList.Any())
+            {
+                return NotFound(new { Message = "No feedback entries found." });
+            }
+
+            return Ok(feedbackList);
+        }
+
+        //[HttpGet("feedback/user/{userId}")]
+        //public IActionResult GetFeedbackByUser(int userId)
+        //{
+        //    var feedback = _context.Feedbacks
+        //        .Where(f => f.UserId == userId)
+        //        .OrderByDescending(f => f.CreatedAt)
+        //        .ToList();
+
+        //    if (!feedback.Any())
+        //    {
+        //        return NotFound(new { Message = $"No feedback found for user ID {userId}." });
+        //    }
+
+        //    return Ok(feedback);
+        //}
+
+
+
+
+    
+
+        //Supervisor Functionalities
+
+       //Supervisor order placement
+
+        [HttpPut("supervisororder")]
+        public async Task<ActionResult<List<StockResponse>>> Stockall([FromBody] List<UserStockRequest> items)
+        {
+            List<StockResponse> result = new List<StockResponse>();
+            try
+            {
+                for (int i = 0; i < items.Count; i++)
+                {
+                    var itemReq = items[i];//get each object from the request
+                    var stock = await _context.Stocks.FirstOrDefaultAsync(x => x.ItemId == itemReq.ItemID); //access the id from the object 
+                    if (stock == null)
+                    {
+                        result.Add(new StockResponse
+                        {
+                            ItemId = itemReq.ItemID,
+                            Success = false,
+                            message = "Bad Request"
+                        });
+                    }
+                    else if (stock.CurrentQuantity < itemReq.QuantityReq)
+                    {
+                        result.Add(new StockResponse
+                        {
+                            ItemId = stock.ItemId,
+                            Success = false,
+                            message = "Less quantity"
+                        });
+                    }
+                    else
+                    {
+                        stock.CurrentQuantity -= itemReq.QuantityReq;
+                        stock.LastUpdated = DateTime.UtcNow;
+
+                        result.Add(new StockResponse
+                        {
+                            ItemId = stock.ItemId,
+                            Success = true,
+                            message = "Successfully ordered"
+                        });
+                    }
+                }
+
+                await _context.SaveChangesAsync();
+                return Ok(result);
+            }
+            catch (Exception e)
+            {
+                return StatusCode(500, $"Internal error: {e.Message}");
+            }
+
+
+        }
+
+       
+
+
+
+        //supervisor's job
+        //changes the values in database based on the status progress=1
+
+        [HttpPut("progress/{id}")]
+
+        public IActionResult Progressmethod([FromRoute] int id)
+
+        {
+
+            try
+
+            {
+
+                dal.SuperComplainStatusChange(id);
+
+                return Ok();
+
+            }
+
+            catch (Exception e)
+
+            {
+
+                return Problem(detail: e.Message, statusCode: 500);
+
+            }
+
+        }
+
+        //supervisor's job
+        //changes the values in database based on the status resolved=2
+        [HttpPut("resolved/{id}")]
+        public IActionResult ResolvedMethod([FromRoute] int id)
+        {
+            try
+            {
+                dal.ResolvedStatus(id);
+                return Ok();
+            }
+            catch (Exception e)
+            {
+                return Problem(detail: e.Message, statusCode: 500);
+            }
+        }
+
+        //supervisorid 
+        //based on login the content will be displayed
+        [HttpGet("super/{id}")]
+        public ActionResult<List<Title>> supercomplaints([FromRoute] int id)
+        {
+            try
+            {
+                var titles = dal.SuperComplains(id);
+                return Ok(titles);
+            }
+            catch (Exception ex)
+            {
+                return Problem(detail: ex.Message, statusCode: 500);
+            }
+        }
+
+
+       
+        //user can see the complaint he raised
+        [HttpGet("mycomp/{id}")]
+        public ActionResult<Mycomplaint> myComp([FromRoute] int id)
+        {
+            try
+            {
+                var res = dal.UserMyComplaint(id);
+                return Ok(res);
+            }
+            catch (Exception ex)
+            {
+                return Problem(detail: ex.Message, statusCode: 500);
+            }
+        }
+
+
+
+
+
+
+    }
+
+}
+
 
